@@ -1,19 +1,40 @@
 """Reusable FastAPI client for local drug-target graph retrieval."""
 
 import argparse
+from contextlib import asynccontextmanager
 import hashlib
 import uuid
 
 import networkx as nx
+import requests
 import torch
 import torch.nn as nn
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-app = FastAPI()
-
 G = None
 CLIENT_NAME = "Unknown"
+COORDINATOR_BASE_URL = "http://localhost:8000"
+
+
+class ClientRuntimeState:
+    """In-memory state restored from the coordinator checkpoint ledger."""
+
+    def __init__(self) -> None:
+        self.last_valid_checkpoint: str | None = None
+
+
+CLIENT_STATE = ClientRuntimeState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run startup checkpoint recovery without deprecated FastAPI event hooks."""
+    resume_from_checkpoint()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class LinkPredictor(nn.Module):
@@ -64,11 +85,53 @@ def train_local_model(drug_id: str) -> dict:
     return state_dict_to_lists(model.state_dict())
 
 
+def resume_from_checkpoint() -> None:
+    """Synchronize this client with its latest committed coordinator checkpoint."""
+    checkpoint_url = f"{COORDINATOR_BASE_URL}/client_checkpoint/{CLIENT_NAME}"
+
+    try:
+        response = requests.get(checkpoint_url, timeout=5)
+        response.raise_for_status()
+        checkpoint = response.json()
+    except requests.RequestException as exc:
+        CLIENT_STATE.last_valid_checkpoint = None
+        print(
+            f"[Checkpoint Recovery] Unable to contact coordinator for node {CLIENT_NAME}: "
+            f"{exc}. Initializing without a recovered checkpoint."
+        )
+        return
+
+    last_update_id = checkpoint.get("last_update_id")
+    if last_update_id:
+        CLIENT_STATE.last_valid_checkpoint = last_update_id
+        print(
+            f"[Checkpoint Recovery] Resuming node {CLIENT_NAME}. "
+            f"Last verified committed update: {last_update_id}"
+        )
+    else:
+        CLIENT_STATE.last_valid_checkpoint = None
+        print(
+            f"[Checkpoint Recovery] No historical checkpoint found for node {CLIENT_NAME}. "
+            "Initializing fresh state."
+        )
+
+
 @app.get("/retrieve")
 def retrieve(drug_id: str) -> dict:
     """Return local graph neighbors for a queried drug ID."""
     if G is None:
         raise HTTPException(status_code=503, detail="Client graph is not loaded")
+
+    if CLIENT_STATE.last_valid_checkpoint:
+        print(
+            f"[Checkpoint Recovery] Node {CLIENT_NAME} serving {drug_id} "
+            f"on recovered baseline {CLIENT_STATE.last_valid_checkpoint}."
+        )
+    else:
+        print(
+            f"[Checkpoint Recovery] Node {CLIENT_NAME} serving {drug_id} "
+            "without a recovered baseline checkpoint."
+        )
 
     model_weights = train_local_model(drug_id)
 

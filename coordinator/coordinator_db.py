@@ -112,3 +112,28 @@ def get_audit_trail(limit: int = 100, db_path: str = "ledger.db") -> list[dict]:
             (limit,),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def get_latest_client_checkpoint(client_name: str, db_path: str = "ledger.db") -> dict | None:
+    """Fetch the most recent committed checkpoint for one federated client."""
+    resolved_path = _resolve_db_path(db_path)
+
+    with sqlite3.connect(resolved_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            """
+            SELECT update_id, timestamp
+            FROM checkpoint_ledger
+            WHERE client_id = ?
+              AND status = 'update_committed'
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (client_name,),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return dict(row)

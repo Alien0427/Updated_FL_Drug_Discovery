@@ -15,7 +15,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from coordinator.coordinator_db import check_if_duplicate, get_audit_trail, log_to_ledger
+from coordinator.coordinator_db import (
+    check_if_duplicate,
+    get_audit_trail,
+    get_latest_client_checkpoint,
+    log_to_ledger,
+)
 
 app = FastAPI()
 
@@ -233,6 +238,25 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
 async def audit_data(limit: int = 100) -> list[dict]:
     """Return recent checkpoint ledger rows as JSON."""
     return await asyncio.to_thread(get_audit_trail, limit, LEDGER_DB_PATH)
+
+
+@app.get("/client_checkpoint/{client_name}")
+async def client_checkpoint(client_name: str) -> dict:
+    """Return the latest committed checkpoint known for a federated client."""
+    checkpoint = await asyncio.to_thread(
+        get_latest_client_checkpoint,
+        client_name,
+        LEDGER_DB_PATH,
+    )
+
+    if checkpoint is None:
+        return {"status": "clean", "last_update_id": None}
+
+    return {
+        "status": "found",
+        "last_update_id": checkpoint["update_id"],
+        "timestamp": checkpoint["timestamp"],
+    }
 
 
 @app.get("/audit", response_class=HTMLResponse)
