@@ -6,10 +6,13 @@
 [![Redis](https://img.shields.io/badge/Redis-Optional%20Stream%20Mirror-red.svg)](https://redis.io/)
 
 Federated biomedical retrieval prototype that:
-- keeps graph partitions local on each client,
-- continues answering under partial client failure,
-- enforces exactly-once update commitment with a checkpoint ledger,
-- exposes runtime metrics for confidence, latency, failure-state, and ledger storage overhead.
+
+- keeps graph partitions local on each lab client,
+- continues answering under partial client failure (`completeness_score`, `missing_clients`),
+- trains a local link-predictor (classification or DeepDTA-style regression) per client,
+- federates model weights with FedAvg on the coordinator,
+- enforces exactly-once update commitment via a SQLite checkpoint ledger,
+- exposes runtime metrics for confidence, latency, failure state, and ledger storage overhead.
 
 ---
 
@@ -20,7 +23,7 @@ Federated biomedical retrieval prototype that:
 3. [Runtime Flow](#runtime-flow)
 4. [Technology Stack](#technology-stack)
 5. [Setup](#setup)
-6. [Runbook (From Scratch)](#runbook-from-scratch)
+6. [Runbook (Live Demo)](#runbook-live-demo)
 7. [Evaluation and Experiments](#evaluation-and-experiments)
 8. [API Reference](#api-reference)
 9. [Project Structure](#project-structure)
@@ -30,17 +33,16 @@ Federated biomedical retrieval prototype that:
 
 ## Core Novelty
 
-This project addresses two practical reliability issues in federated retrieval:
-
-| Reliability Problem | Implementation |
+| Reliability problem | Implementation |
 |---|---|
-| Client timeout/crash during query | Async parallel retrieval + degraded but valid response (`completeness_score`, `missing_clients`) |
-| Stale update replay after reboot | Exactly-once duplicate detection using committed `update_id`; duplicates logged as `duplicate_ignored` and skipped |
+| Client timeout or crash during query | Async parallel retrieval + degraded but valid partial answer |
+| Stale update replay after reboot | Exactly-once duplicate detection on committed `update_id`; replays logged as `duplicate_ignored` and excluded from evidence |
 
-### Why this is different
-- Uses lightweight **SQLite append-only ledger** (not blockchain consensus) for exactly-once semantics.
-- Adds a rich event taxonomy for full auditability.
-- Mirrors ledger events to Redis Streams optionally to prove backend-agnostic design.
+**Design choices**
+
+- **SQLite append-only ledger** (not blockchain) for exactly-once semantics and full audit trail.
+- **Rich event taxonomy** (`query_started` → `update_committed`, etc.).
+- **Optional Redis Stream mirror** (`federated:ledger:stream`) — SQLite remains source of truth; Redis is not a cache and does not speed up HTTP APIs.
 
 ---
 
@@ -53,10 +55,10 @@ flowchart LR
 
     subgraph CO[Coordinator API :8000]
       C[coordinator_api.py]
-      O1[Parallel Query Orchestrator]
-      O2[Duplicate Check (Exactly-Once)]
-      O3[FedAvg Aggregation]
-      O4[Performance Metrics: latency, system_state, ledger_size_kb]
+      O1[Parallel query orchestrator]
+      O2[Duplicate check exactly-once]
+      O3[FedAvg aggregation]
+      O4[Performance metrics]
       C --> O1 --> O2 --> O3 --> O4
     end
 
@@ -64,49 +66,42 @@ flowchart LR
     C -->|async /retrieve| C2
     C -->|async /retrieve| C3
 
-    subgraph CL[Lab Clients]
-      C1[Client_1 :8001\nGraphML partition + PyTorch]
-      C2[Client_2 :8002\nGraphML partition + PyTorch]
-      C3[Client_3 :8003\nGraphML partition + PyTorch]
+    subgraph CL[Lab clients]
+      C1[Client_1 :8001]
+      C2[Client_2 :8002]
+      C3[Client_3 :8003]
     end
 
-    C1 -->|targets, ml_score, update_id, metrics| C
-    C2 -->|targets, ml_score, update_id, metrics| C
-    C3 -->|targets, ml_score, update_id, metrics| C
+    C1 -->|targets, metrics, update_id| C
+    C2 -->|targets, metrics, update_id| C
+    C3 -->|targets, metrics, update_id| C
 
-    C -->|append lifecycle events| SQL[(SQLite ledger.db\nsource of truth)]
-    C -. optional mirror .-> REDIS[(Redis Stream\nfederated:ledger:stream)]
+    C -->|append lifecycle events| SQL[(SQLite ledger.db)]
+    C -. optional mirror .-> REDIS[(Redis Stream)]
 
-    SQL --> AUD[/audit_data + /audit dashboard/]
+    SQL --> AUD[/audit dashboard/]
 ```
+
+Each client loads a **NetworkX GraphML partition**, trains a **PyTorch LinkPredictor** on sampled edges, scores neighbors for the queried drug, and returns evidence plus optional model weights for FedAvg.
 
 ---
 
 ## Runtime Flow
 
-1. `GET /global_retrieve?drug_id=...` hits coordinator.
-2. Coordinator generates `query_id`, `round_id`, logs `query_started`.
-3. Coordinator sends parallel `/retrieve` requests to all clients.
-4. Per response:
-   - logs `client_responded`,
-   - runs `check_if_duplicate(update_id)`,
-   - if duplicate: logs `duplicate_ignored` and skips commit,
-   - else logs `update_uploaded` and `update_committed`.
-5. Aggregates evidence + model weights, computes confidence and gas metrics.
-6. Computes `performance_metrics`:
-   - `total_latency_ms`
-   - `system_state` (`no_failure` / `failure`)
-   - `ledger_size_kb`
-7. `/audit` displays lifecycle rows and live ledger storage overhead.
+1. `GET /global_retrieve?drug_id=...` hits the coordinator.
+2. Coordinator assigns `query_id`, increments in-memory `round_id`, logs `query_started`.
+3. Parallel `/retrieve` calls to all three clients (90s timeout each in full ML mode).
+4. Per client response:
+   - log `client_responded`,
+   - `check_if_duplicate(update_id)` against committed rows,
+   - if duplicate → `duplicate_ignored`, skip evidence and commit,
+   - else → `update_uploaded` (when weights present) and `update_committed`.
+5. Merge evidence paths, FedAvg weights, compute confidence and gas metrics.
+6. Return JSON including `performance_metrics` (`total_latency_ms`, `system_state`, `ledger_size_kb`).
 
-### Event Taxonomy
-- `query_started`
-- `client_responded`
-- `update_uploaded`
-- `update_committed`
-- `duplicate_ignored`
-- `client_timeout`
-- `client_recovered`
+### Ledger event taxonomy
+
+`query_started` · `client_responded` · `update_uploaded` · `update_committed` · `duplicate_ignored` · `client_timeout` · `client_recovered`
 
 ---
 
@@ -114,174 +109,229 @@ flowchart LR
 
 | Layer | Tools |
 |---|---|
-| API server | FastAPI, Uvicorn |
-| Graph retrieval | NetworkX |
-| Local model scoring | PyTorch |
-| Link-prediction metrics | scikit-learn |
-| Async coordinator calls | httpx |
-| Exactly-once ledger | SQLite |
-| Optional stream backend | redis-py + Redis Streams |
-| Analysis scripts | pandas, matplotlib, numpy |
+| API | FastAPI, Uvicorn |
+| Graph | NetworkX (GraphML partitions) |
+| Local ML | PyTorch (embeddings + MLP link predictor) |
+| Metrics | scikit-learn (classification); MSE / R² (regression) |
+| Coordinator I/O | httpx (async) |
+| Ledger | SQLite (`coordinator/coordinator_db.py`) |
+| Optional mirror | redis-py → Redis Stream |
+| Evaluation | pandas, matplotlib, aiohttp (load tester) |
 
 ---
 
 ## Setup
 
-All commands assume project root.
+All commands assume project root with an active virtual environment.
 
-### 1) Create and activate virtual environment
+### 1) Virtual environment (Windows PowerShell)
 
-```bash
+```powershell
 python -m venv venv
-```
-
-Windows (PowerShell):
-
-```bash
 .\venv\Scripts\Activate.ps1
-```
-
-### 2) Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 3) Build graph partitions
+### 2) Data pipeline
 
-```bash
+```powershell
 python download_data.py
 python graph_builder.py
 python partition_data.py
 ```
 
-Expected files:
+Expected outputs:
+
 - `data/client_1_graph.graphml`
 - `data/client_2_graph.graphml`
 - `data/client_3_graph.graphml`
 
-### 4) Initialize ledger
+### 3) Initialize ledger schema
 
-```bash
+```powershell
 python ledger/ledger_manager.py
 ```
 
+### 4) Optional Redis (Docker)
+
+Start Redis **before** the coordinator if you want stream mirroring:
+
+```powershell
+docker run -d --name redis-nitt -p 6379:6379 redis:7-alpine
+docker exec redis-nitt redis-cli PING
+```
+
+The coordinator pings `localhost:6379` once at import time. There is no console log on success; verify with:
+
+```powershell
+docker exec redis-nitt redis-cli XLEN federated:ledger:stream
+```
+
+Restart the coordinator after Redis is up if it was started without Redis.
+
 ---
 
-## Runbook (From Scratch)
+## Runbook (Live Demo)
 
-Open four terminals (venv active), then run:
+Open **four terminals** (venv active).
 
-Terminal 1:
+**Terminal 1 — Coordinator**
 
-```bash
-python client_api.py --port 8001 --file data/client_1_graph.graphml --name Client_1
-```
-
-Terminal 2:
-
-```bash
-python client_api.py --port 8002 --file data/client_2_graph.graphml --name Client_2
-```
-
-Terminal 3:
-
-```bash
-python client_api.py --port 8003 --file data/client_3_graph.graphml --name Client_3
-```
-
-Terminal 4:
-
-```bash
+```powershell
 python coordinator/coordinator_api.py
 ```
 
-Test query:
+**Terminal 2 — Client 1**
 
-```text
-http://localhost:8000/global_retrieve?drug_id=CID000000271
+```powershell
+python client_api.py --port 8001 --file data/client_1_graph.graphml --name Client_1
 ```
 
-Audit dashboard:
+**Terminal 3 — Client 2**
+
+```powershell
+python client_api.py --port 8002 --file data/client_2_graph.graphml --name Client_2
+```
+
+**Terminal 4 — Client 3**
+
+```powershell
+python client_api.py --port 8003 --file data/client_3_graph.graphml --name Client_3
+```
+
+### Quick API checks
+
+**Single client (classification, browser-safe JSON — no full weight tensors):**
+
+```powershell
+curl "http://localhost:8001/retrieve?drug_id=CID000000271"
+```
+
+**Regression mode (Task 20 — DeepDTA-style affinity):**
+
+```powershell
+curl "http://localhost:8001/retrieve?drug_id=CID000000271&task_type=regression"
+```
+
+**Federated retrieve (save large JSON to file):**
+
+```powershell
+curl "http://localhost:8000/global_retrieve?drug_id=CID000000271&mode=aware" -o response.json
+```
+
+**Audit dashboard (browser):**
 
 ```text
 http://localhost:8000/audit
 ```
 
+### Evaluation scripts (Terminal 5)
+
+```powershell
+python load_tester.py
+python data_collection.py
+python visualize_metrics.py
+python simulate_recovery.py
+python evaluate_baselines.py
+python experiment_duplicate_rate.py
+```
+
+`load_tester.py` defaults: 10 queries, full ML per query, random Client 2 kill/restart (~40% fault rate). Charts: `reliability_chart.png`, `recovery_chart.png`.
+
 ---
 
 ## Evaluation and Experiments
 
-## 1) Failure vs no-failure latency (Task 14)
+### Failure vs healthy latency (Task 14)
 
-- Healthy run: all 3 clients up -> `completeness_score = 3/3` and `system_state = no_failure`.
-- Failure run: stop one client -> `<3/3` and `system_state = failure`.
-- Compare `performance_metrics.total_latency_ms` across both.
+- All clients up → `completeness_score = 3/3`, `system_state = no_failure`.
+- One client down → `<3/3`, `system_state = failure`.
+- Compare `performance_metrics.total_latency_ms`.
 
-## 2) Duplicate replay experiment (Task 16)
+### Duplicate replay (Task 16)
 
-```bash
+```powershell
 python experiment_duplicate_rate.py
 ```
 
-Prints:
-- analytical no-ledger baseline duplicate rate,
-- exactly-once interception rate,
-- number of `duplicate_ignored` rows.
+Reports baseline duplicate rate vs exactly-once interception and `duplicate_ignored` counts.
 
-## 3) Storage overhead experiment (Task 18)
+### Recovery simulation
 
-- `/audit` shows: `Ledger Storage Overhead: ... KB/MB`
-- `/global_retrieve` returns: `performance_metrics.ledger_size_kb`
-
-## 4) Optional Redis mirror validation
-
-If Redis is running before coordinator startup:
-
-```bash
-redis-cli XLEN federated:ledger:stream
-redis-cli XREVRANGE federated:ledger:stream + - COUNT 5
+```powershell
+python simulate_recovery.py
 ```
 
-SQLite remains source of truth even when Redis is unavailable.
+Stops real Client 1, serves a stale payload with an already-committed `update_id`, and verifies dummy targets are excluded from `evidence_paths`.
+
+### Storage overhead (Task 18)
+
+- `/audit` — ledger size badge
+- `/global_retrieve` → `performance_metrics.ledger_size_kb`
+
+### Redis mirror validation
+
+After a `global_retrieve` with Redis running before coordinator boot:
+
+```powershell
+docker exec redis-nitt redis-cli XREVRANGE federated:ledger:stream + - COUNT 5
+```
+
+Events are duplicated from SQLite into the stream; they are not stored as files under the project tree.
+
+### Gas optimization metrics (simulated)
+
+Toy cost model in the coordinator response:
+
+- `simulated_unbatched_gas` = 100 × number of evidence targets
+- `actual_batched_gas` = 40 × number of successful clients
+- `gas_saved_percentage` = percent saved by batching per client vs per target
+
+Positive values are typical when clients return many neighbors; small runs with few paths may still show lower savings.
 
 ---
 
 ## API Reference
 
-### `GET /retrieve?drug_id={drug_id}` (client)
+### `GET /retrieve` (client)
 
-Key fields:
-- `status`: `success` / `not_found`
-- `targets` (optional `ml_score`)
-- `update_id`, `batch_hash`
-- `metrics`: `precision`, `recall`, `f1_score`, `top_50_precision`
-- `local_confidence`
-- `model_weights`
+| Parameter | Default | Description |
+|---|---|---|
+| `drug_id` | required | Drug node ID (e.g. `CID000000271`) |
+| `task_type` | `classification` | `classification` or `regression` |
+| `include_weights` | `false` | `true` sends full tensors (coordinator FedAvg); `false` sends `model_weights_summary` only |
+| `fast` | `false` | Skip ML training; graph neighbors only (demo / load-test shortcut) |
 
-### `GET /global_retrieve?drug_id={drug_id}&mode={aware|unaware}` (coordinator)
+Key response fields: `status`, `targets` (`path`, `ml_score`), `metrics`, `update_id`, `batch_hash`, `local_confidence`.
 
-Key fields:
-- `query_id`, `round_id`
-- `completeness_score`, `available_clients`, `missing_clients`
-- `evidence_paths`, `evidence_paths_count`
-- `client_link_prediction_metrics`
-- `federated_link_prediction_metrics`
-- `gas_optimization_metrics`
-- `performance_metrics`:
-  - `total_latency_ms`
-  - `system_state`
-  - `ledger_size_kb`
-- `raw_responses` (sanitized)
+**Classification metrics:** `precision`, `recall`, `f1_score`, `top_50_precision`  
+**Regression metrics:** `mse`, `r2`
 
-### `GET /audit_data?limit=100`
-Returns latest ledger rows as JSON.
+### `GET /global_retrieve` (coordinator)
 
-### `GET /audit`
-Returns dashboard HTML with lifecycle rows and storage overhead badge.
+| Parameter | Default | Description |
+|---|---|---|
+| `drug_id` | required | Drug to query across all clients |
+| `mode` | `aware` | `aware` returns partial answers; `unaware` errors if any client missing |
+| `task_type` | `classification` | Passed to all clients |
+| `fast` | `false` | Propagates fast graph-only mode to clients |
 
-### `GET /client_checkpoint/{client_name}`
-Returns latest committed checkpoint metadata and logs `client_recovered` when applicable.
+Key response fields:
+
+- `query_id`, `round_id`, `completeness_score`, `retrieval_confidence_score`
+- `available_clients`, `missing_clients`, `evidence_paths`
+- `client_link_prediction_metrics`, `federated_link_prediction_metrics`
+- `global_aggregated_model` (layer shapes only in API)
+- `gas_optimization_metrics`, `performance_metrics`
+- `raw_responses` (weights stripped)
+
+### Other coordinator routes
+
+| Route | Purpose |
+|---|---|
+| `GET /audit_data?limit=100` | Latest ledger rows as JSON |
+| `GET /audit` | HTML audit dashboard |
+| `GET /client_checkpoint/{client_name}` | Latest committed checkpoint metadata |
 
 ---
 
@@ -289,25 +339,24 @@ Returns latest committed checkpoint metadata and logs `client_recovered` when ap
 
 ```text
 FL_DRUG_DISCOVERY/
-├── client_api.py
+├── client_api.py              # Client API + LinkPredictor training
 ├── coordinator/
-│   ├── coordinator_api.py
-│   └── coordinator_db.py
+│   ├── coordinator_api.py     # Federated orchestrator + FedAvg
+│   └── coordinator_db.py      # SQLite ledger + optional Redis mirror
 ├── ledger/
-│   ├── ledger_manager.py
-│   └── ledger.db
-├── data/
-│   ├── ChG-TargetDecagon_targets.csv.gz
-│   ├── client_1_graph.graphml
-│   ├── client_2_graph.graphml
-│   └── client_3_graph.graphml
-├── audit.html
+│   ├── ledger_manager.py      # Schema init
+│   └── ledger.db              # Append-only audit log (local)
+├── data/                      # GraphML partitions (generated)
+├── audit.html                 # Audit dashboard template
+├── load_tester.py             # Fault-injection load test
+├── simulate_recovery.py       # Stale replay demo
 ├── experiment_duplicate_rate.py
 ├── evaluate_baselines.py
 ├── data_collection.py
 ├── visualize_metrics.py
-├── load_tester.py
-├── simulate_recovery.py
+├── download_data.py
+├── graph_builder.py
+├── partition_data.py
 ├── requirements.txt
 └── README.md
 ```
@@ -318,11 +367,14 @@ FL_DRUG_DISCOVERY/
 
 | Issue | Resolution |
 |---|---|
-| `Errno 10048` port already in use | Find PID: `netstat -ano | findstr :800X`; kill: `taskkill /PID <pid> /F` |
-| New fields missing in API/dashboard | Restart coordinator after code updates |
-| Pull blocked by local changes | `git stash`; pull; `git stash pop` |
-| Redis unavailable | Expected fallback: SQLite-only mode remains functional |
-| Unexpected `2/3` completeness | Ensure all three clients are running and reachable |
+| Port already in use (`10048`) | `netstat -ano \| findstr :800X` then `taskkill /PID <pid> /F` |
+| Browser hangs on client `/retrieve` | Use default (`include_weights=false`) or coordinator `/global_retrieve`; do not paste huge JSON in browser |
+| `load_tester` kills Client 2 but manual Client 2 also running | Use either manual Client 2 **or** load tester auto-restart, not both |
+| Redis stream empty | Start Redis before coordinator; restart coordinator after Redis is up |
+| `round_id` always `1` in old ledger rows | Legacy rows before taxonomy migration; sort by `id DESC` for current rows |
+| NULL `request_id` / `evidence_hash` in old rows | Columns added later; new `/global_retrieve` runs populate them |
+| Coordinator timeout on load test | Full ML takes ~30–90s per client; default coordinator timeout is 120s |
+| Unexpected `2/3` completeness | One client down, timed out, or still restarting after chaos injection |
 
 ---
 
