@@ -41,9 +41,27 @@ REGRESSION_LOW_AFFINITY = (0.0, 3.0)
 REGRESSION_SCORE_THRESHOLD = 5.0
 
 # ---------------------------------------------------------------------------
+# DHT Identity — generated at startup from PEER_NAME + PORT
+# ---------------------------------------------------------------------------
+NODE_ID: int = 0          # 256-bit integer Kademlia node ID
+NODE_ID_HEX: str = ""     # First 16 hex chars for human-readable logs
+
+
+def _generate_node_id(peer_name: str, port: int) -> tuple[int, str]:
+    """Derive a stable 256-bit node ID from peer identity."""
+    identity = f"{peer_name}:{port}"
+    hex_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return int(hex_digest, 16), hex_digest[:16]
+
+
+# ---------------------------------------------------------------------------
 # Peer Membership State
 # Key   : peer base URL  (e.g. "http://localhost:8002")
-# Value : {"last_seen": ISO-8601 str | None, "status": "active" | "offline"}
+# Value : {
+#     "last_seen" : ISO-8601 str | None,
+#     "status"    : "active" | "offline",
+#     "node_id"   : int | None   <- DHT identity of the remote peer
+# }
 # ---------------------------------------------------------------------------
 KNOWN_PEERS: dict[str, dict] = {}
 
@@ -79,8 +97,13 @@ async def heartbeat_loop() -> None:
                     now = datetime.now(timezone.utc).isoformat()
                     KNOWN_PEERS[url]["last_seen"] = now
                     KNOWN_PEERS[url]["status"] = "active"
+                    # Capture node_id from ping response if not yet stored
+                    ping_data = resp.json()
+                    if KNOWN_PEERS[url].get("node_id") is None and "node_id" in ping_data:
+                        KNOWN_PEERS[url]["node_id"] = ping_data["node_id"]
                     if previous_status != "active":
-                        print(f"[Heartbeat] [ONLINE] Peer back ONLINE: {url}")
+                        nid_short = str(KNOWN_PEERS[url].get("node_id", ""))[:8] or "unknown"
+                        print(f"[Heartbeat] [ONLINE] Peer back ONLINE: {url} (node_id_prefix={nid_short})")
                 except (httpx.TimeoutException, httpx.ConnectError, Exception):
                     KNOWN_PEERS[url]["status"] = "offline"
                     if previous_status != "offline":
@@ -520,10 +543,12 @@ def sanitize_peer_response_for_api(response: dict) -> dict:
 
 @app.get("/ping")
 def ping() -> dict:
-    """Health-check / heartbeat target. Returns this peer's live identity."""
+    """Health-check / heartbeat target. Returns this peer's live identity and DHT node ID."""
     return {
         "status": "alive",
         "peer_id": PEER_NAME,
+        "node_id": NODE_ID,
+        "node_id_hex_prefix": NODE_ID_HEX,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -546,6 +571,7 @@ def add_peer(url: str) -> dict:
     KNOWN_PEERS[url] = {
         "last_seen": None,
         "status": "active",
+        "node_id": None,  # Will be populated on next heartbeat cycle
     }
     print(f"[Membership] [+] New peer added: {url} (total known: {len(KNOWN_PEERS)})")
     return {
@@ -557,11 +583,97 @@ def add_peer(url: str) -> dict:
 
 @app.get("/peers")
 def list_peers() -> dict:
-    """Return the current peer membership list with status information."""
+    """Return the current peer membership list with status and DHT node IDs."""
     return {
         "self": PEER_NAME,
+        "self_node_id": NODE_ID,
+        "self_node_id_hex_prefix": NODE_ID_HEX,
         "total_known": len(KNOWN_PEERS),
         "peers": KNOWN_PEERS,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DHT Routing — XOR distance math & closest-peer lookup
+# ---------------------------------------------------------------------------
+
+def calculate_xor_distance(id1: int, id2: int) -> int:
+    """Compute Kademlia-style XOR distance between two 256-bit node IDs.
+
+    Lower result means the two nodes are 'closer' in the DHT ring.
+    """
+    return id1 ^ id2
+
+
+@app.get("/closest_peers")
+def closest_peers(target_id: str, limit: int = 2) -> dict:
+    """Return the ``limit`` peers closest to ``target_id`` by XOR distance.
+
+    Args:
+        target_id: The target DHT key as a decimal integer string or
+                   a 0x-prefixed / bare hex string.
+        limit:     How many closest peers to return (default 2).
+
+    The response includes this node itself as a candidate so the caller
+    always gets a complete Kademlia k-bucket view.
+    """
+    # --- Parse target_id (accept decimal int string or hex string) ----------
+    try:
+        if isinstance(target_id, str) and target_id.startswith("0x"):
+            target_int = int(target_id, 16)
+        else:
+            # Try decimal first, fall back to bare hex
+            try:
+                target_int = int(target_id)
+            except ValueError:
+                target_int = int(target_id, 16)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"target_id '{target_id}' is not a valid integer or hex string. "
+                "Pass a decimal integer or a hex string (optionally prefixed with 0x)."
+            ),
+        )
+
+    # --- Build candidate list (self + active known peers) -------------------
+    candidates: list[dict] = []
+
+    # Include self
+    candidates.append({
+        "url": "self",
+        "peer_id": PEER_NAME,
+        "node_id": NODE_ID,
+        "node_id_hex_prefix": NODE_ID_HEX,
+        "xor_distance": calculate_xor_distance(NODE_ID, target_int),
+        "status": "active",
+    })
+
+    # Include active known peers that have a resolved node_id
+    for url, info in KNOWN_PEERS.items():
+        if info.get("status") != "active":
+            continue
+        peer_node_id = info.get("node_id")
+        if peer_node_id is None:
+            continue
+        candidates.append({
+            "url": url,
+            "peer_id": info.get("peer_id", "unknown"),
+            "node_id": peer_node_id,
+            "node_id_hex_prefix": hex(peer_node_id)[:18],
+            "xor_distance": calculate_xor_distance(peer_node_id, target_int),
+            "status": "active",
+        })
+
+    # --- Sort by XOR distance (ascending = closest first) -------------------
+    candidates.sort(key=lambda c: c["xor_distance"])
+    closest = candidates[:limit]
+
+    return {
+        "target_id": target_int,
+        "limit": limit,
+        "total_candidates": len(candidates),
+        "closest_peers": closest,
     }
 
 
@@ -632,6 +744,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     PEER_NAME = args.name
+
+    # Generate stable DHT node ID from peer identity
+    NODE_ID, NODE_ID_HEX = _generate_node_id(PEER_NAME, args.port)
+    print(f"[DHT] {PEER_NAME} node_id_hex_prefix={NODE_ID_HEX} (256-bit SHA-256 of '{PEER_NAME}:{args.port}')")
+
     load_peer_graph(args.file, peer_name=PEER_NAME)
 
     print(f"[Peer Node] Starting {PEER_NAME} on port {args.port}")
