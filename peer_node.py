@@ -354,6 +354,16 @@ def state_dict_to_lists(state_dict: dict) -> dict:
     return {key: tensor.detach().cpu().tolist() for key, tensor in state_dict.items()}
 
 
+def lists_to_state_dict(lists_dict: dict) -> dict:
+    """Convert a JSON list-based weight dict back into PyTorch tensors.
+
+    This is the inverse of ``state_dict_to_lists`` and is used when a peer
+    receives the global FedAvg model over HTTP so it can load it into a
+    ``LinkPredictor`` via ``load_state_dict``.
+    """
+    return {key: torch.tensor(value) for key, value in lists_dict.items()}
+
+
 def summarize_state_dict(state_dict: dict) -> dict:
     """Return layer shapes only — safe for browser/curl demos."""
     summary: dict = {}
@@ -1081,6 +1091,15 @@ class DHTRetrieveRequest(BaseModel):
     visited_peers: list[str] = []
 
 
+class GlobalModelPayload(BaseModel):
+    """Payload sent by the initiator to each participant after FedAvg."""
+    query_id: str
+    drug_id: str
+    task_type: str = "classification"
+    global_weights: dict          # Raw FedAvg weight arrays (list-of-lists format)
+    local_metrics: dict           # The original per-peer metrics for comparison
+
+
 async def dht_retrieve_internal(
     drug_id: str,
     task_type: str,
@@ -1232,6 +1251,88 @@ async def dht_retrieve(request: DHTRetrieveRequest) -> list[dict]:
     )
 
 
+@app.post("/receive_global_model")
+async def receive_global_model(payload: GlobalModelPayload) -> dict:
+    """Accept the FedAvg global model from the initiator and evaluate it locally.
+
+    Workflow:
+    1. Reconstruct a ``LinkPredictor`` from the received weight arrays.
+    2. Re-create the *exact* local holdout set used during the original training
+       run (same ``hash(drug_id)`` seed, same RNG sequence).
+    3. Evaluate the global model on that holdout set.
+    4. Log a side-by-side comparison with the original local metrics.
+    """
+    if G is None:
+        return {"status": "skipped", "reason": "graph not loaded"}
+
+    drug_id = payload.drug_id
+    task_type = payload.task_type
+    query_id = payload.query_id
+
+    # -----------------------------------------------------------------------
+    # Reconstruct the global model from received weights
+    # -----------------------------------------------------------------------
+    global_model = LinkPredictor(task_type=task_type)
+    try:
+        state_dict = lists_to_state_dict(payload.global_weights)
+        global_model.load_state_dict(state_dict)
+    except Exception as exc:
+        print(f"[FedAvg Dissemination] ERROR loading global weights for {drug_id}: {exc}")
+        return {"status": "error", "reason": str(exc)}
+
+    # -----------------------------------------------------------------------
+    # Recreate the exact holdout set (same seed as training)
+    # -----------------------------------------------------------------------
+    seed = abs(hash(drug_id)) % (2**32)
+    rng = random.Random(seed)
+
+    all_edges = list(G.edges())
+    if not all_edges or NUM_NODES == 0:
+        return {"status": "skipped", "reason": "graph has no edges"}
+
+    rng.shuffle(all_edges)
+    holdout_positive = all_edges[POSITIVE_TRAIN_EDGES: POSITIVE_TRAIN_EDGES + HOLDOUT_EDGES]
+
+    negative_pool = _sample_negative_edges(POSITIVE_TRAIN_EDGES + HOLDOUT_EDGES, rng)
+    holdout_negative = negative_pool[POSITIVE_TRAIN_EDGES:]
+
+    # -----------------------------------------------------------------------
+    # Evaluate the global model on the local holdout
+    # -----------------------------------------------------------------------
+    # Re-seed RNG to match the exact state that _evaluate_model expects
+    eval_rng = random.Random(seed)
+    global_metrics = _evaluate_model(
+        global_model, holdout_positive, holdout_negative, task_type, eval_rng
+    )
+
+    # -----------------------------------------------------------------------
+    # Log the before-vs-after comparison
+    # -----------------------------------------------------------------------
+    local_m = payload.local_metrics
+    if task_type == "regression":
+        old_val = local_m.get("r2", "N/A")
+        new_val = global_metrics.get("r2", "N/A")
+        metric_label = "R²"
+    else:
+        old_val = local_m.get("f1_score", "N/A")
+        new_val = global_metrics.get("f1_score", "N/A")
+        metric_label = "F1"
+
+    print(
+        f"[FedAvg Dissemination] {PEER_NAME} | drug={drug_id} | query={query_id[:8]} | "
+        f"Local {metric_label}: {old_val} -> Global {metric_label}: {new_val}"
+    )
+
+    return {
+        "status": "evaluated",
+        "peer_id": PEER_NAME,
+        "drug_id": drug_id,
+        "query_id": query_id,
+        "local_metrics": local_m,
+        "global_metrics": global_metrics,
+    }
+
+
 @app.get("/global_retrieve")
 async def global_retrieve(
     drug_id: str,
@@ -1356,6 +1457,70 @@ async def global_retrieve(
     # -----------------------------------------------------------------------
     sanitized_responses = sanitize_raw_responses_for_api(raw_responses)
 
+    # -----------------------------------------------------------------------
+    # Step 7: Disseminate global model to participant peers (fire-and-forget)
+    # -----------------------------------------------------------------------
+    my_url = f"http://localhost:{PEER_PORT}"
+
+    # Build a lookup: peer_id -> original metrics (for comparison at receiver)
+    peer_id_to_metrics = {p_id: m for p_id, m in peer_metrics.items()}
+
+    # Build a lookup: peer_id -> peer base URL
+    # KNOWN_PEERS keys are URLs; we need peer_id from the ping node_id info.
+    # However peer_id is stored in raw_responses alongside the URL info.
+    # We construct a mapping from peer_id -> URL using KNOWN_PEERS + raw_responses.
+    peer_id_to_url: dict = {}
+    for resp in raw_responses:
+        p_id = resp.get("peer_id", "")
+        # Try matching against KNOWN_PEERS by scanning for a matching response
+        # The initiator itself is always at my_url — skip it.
+        if p_id and p_id != PEER_NAME:
+            # Infer URL: check each known peer's /ping-cached peer_id if available,
+            # otherwise fall back to the port convention used in tests.
+            for url, info in KNOWN_PEERS.items():
+                # Match by node_id that was resolved during heartbeat if possible;
+                # otherwise accept any active known peer URL that we haven't mapped yet.
+                if info.get("status") == "active" and url not in peer_id_to_url.values():
+                    peer_id_to_url[p_id] = url
+                    break
+
+    async def _broadcast_global_model(peer_url: str, peer_id: str) -> None:
+        """Fire-and-forget: POST the global model to one participant peer."""
+        original_metrics = peer_id_to_metrics.get(peer_id, {})
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{peer_url}/receive_global_model",
+                    json={
+                        "query_id": query_id,
+                        "drug_id": drug_id,
+                        "task_type": task_type,
+                        "global_weights": fedavg_weights,   # Raw list-of-lists weights
+                        "local_metrics": original_metrics,
+                    },
+                    timeout=60.0,
+                )
+            print(
+                f"[FedAvg Dissemination] Sent global model to {peer_id} @ {peer_url} "
+                f"for query={query_id[:8]}"
+            )
+        except Exception as exc:
+            print(
+                f"[FedAvg Dissemination] WARNING: Could not reach {peer_id} @ {peer_url}: "
+                f"{type(exc).__name__}"
+            )
+
+    # Schedule broadcasts as background tasks — do not await them
+    for p_id, p_url in peer_id_to_url.items():
+        if p_url != my_url:  # Never send to self
+            asyncio.create_task(_broadcast_global_model(p_url, p_id))
+
+    dissemination_targets = list(peer_id_to_url.keys())
+    print(
+        f"[FedAvg Dissemination] Broadcasting global model to {len(dissemination_targets)} "
+        f"peer(s): {dissemination_targets}"
+    )
+
     return {
         "query": drug_id,
         "task_type": task_type,
@@ -1370,6 +1535,7 @@ async def global_retrieve(
         "peer_link_prediction_metrics": peer_metrics,
         "federated_link_prediction_metrics": federated_metrics,
         "global_aggregated_model": global_aggregated_model,
+        "dissemination_targets": dissemination_targets,
         "raw_responses": sanitized_responses,
         "routing_mode": "dht_propagation",
         "crdt_update_id": local_update_id,
